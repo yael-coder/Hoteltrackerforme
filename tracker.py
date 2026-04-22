@@ -5,6 +5,7 @@ import re
 import logging
 from datetime import datetime
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 import aiohttp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,94 +67,196 @@ def save_hotels(hotels: list):
         json.dump(hotels, f, indent=2)
 
 
-def extract_price(text: str) -> float | None:
-    cleaned = re.sub(r'[,$€£¥\s]', '', text)
-    for m in re.finditer(r'\d{2,5}(?:\.\d{1,2})?', cleaned):
+def extract_prices_from_text(text: str) -> list[float]:
+    cleaned = re.sub(r'[,$€£¥]', '', text)
+    prices = []
+    for m in re.finditer(r'\b(\d{2,5})(?:\.\d{1,2})?\b', cleaned):
         try:
             price = float(m.group())
-            if 30 < price < 15000:
-                return price
+            if 40 < price < 15000:
+                prices.append(price)
         except ValueError:
             continue
-    return None
+    return prices
 
 
 async def _make_page(playwright):
     browser = await playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1280,800",
+        ],
     )
     ctx = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
         viewport={"width": 1280, "height": 800},
         locale="en-US",
+        timezone_id="America/New_York",
     )
     page = await ctx.new_page()
-    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    await stealth_async(page)
     return browser, page
 
 
-async def scrape_booking(page, name, checkin, checkout):
+async def scrape_google_hotels(page, name: str, checkin: str, checkout: str) -> float | None:
     try:
         ci = datetime.strptime(checkin, "%d/%m/%Y").strftime("%Y-%m-%d")
         co = datetime.strptime(checkout, "%d/%m/%Y").strftime("%Y-%m-%d")
-        await page.goto(f"https://www.booking.com/searchresults.html?ss={name.replace(' ', '+')}&checkin={ci}&checkout={co}&group_adults=2&no_rooms=1&selected_currency=USD", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(3000)
-        for sel in ['[data-testid="price-and-discounted-price"]', '.prco-valign-middle-helper', '.bui-price-display__value', '[class*="price"]']:
-            for el in await page.query_selector_all(sel):
-                price = extract_price(await el.inner_text())
-                if price:
-                    logger.info(f"Booking.com → ${price}")
-                    return price
-    except Exception as e:
-        logger.error(f"Booking.com error: {e}")
-    return None
-
-
-async def scrape_expedia(page, name, checkin, checkout):
-    try:
-        ci = datetime.strptime(checkin, "%d/%m/%Y").strftime("%m/%d/%Y")
-        co = datetime.strptime(checkout, "%d/%m/%Y").strftime("%m/%d/%Y")
-        await page.goto(f"https://www.expedia.com/Hotel-Search?destination={name.replace(' ', '+')}&startDate={ci}&endDate={co}&adults=2", wait_until="domcontentloaded", timeout=45000)
+        url = (
+            f"https://www.google.com/travel/hotels"
+            f"?q={name.replace(' ', '+')}"
+            f"&checkin={ci}&checkout={co}&adults=2&curr=USD"
+        )
+        await page.goto(url, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(4000)
-        for sel in ['[data-stid="price-summary"]', '[class*="uitk-type-500"]', '[class*="price-summary"]', '[class*="price"]']:
-            for el in await page.query_selector_all(sel):
-                price = extract_price(await el.inner_text())
-                if price:
-                    logger.info(f"Expedia → ${price}")
-                    return price
-    except Exception as e:
-        logger.error(f"Expedia error: {e}")
-    return None
 
+        title = await page.title()
+        logger.info(f"Google Hotels page title: {title}")
 
-async def scrape_google_hotels(page, name, checkin, checkout):
-    try:
-        ci = datetime.strptime(checkin, "%d/%m/%Y").strftime("%Y-%m-%d")
-        co = datetime.strptime(checkout, "%d/%m/%Y").strftime("%Y-%m-%d")
-        await page.goto(f"https://www.google.com/travel/hotels?q={name.replace(' ', '+')}&checkin={ci}&checkout={co}&adults=2", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(5000)
-        for sel in ['[class*="kR1eme"]', '[class*="prxnNd"]', '[data-item-name="total-price"]', 'span[aria-label*="$"]', '[class*="price"]']:
+        for sel in [
+            '[jsname="qR3tGb"]',
+            '[class*="kR1eme"]',
+            '[class*="prxnNd"]',
+            '[data-item-name="total-price"]',
+            'span[aria-label*="$"]',
+            '[class*="hotel-price"]',
+        ]:
             for el in await page.query_selector_all(sel):
-                price = extract_price(await el.inner_text())
-                if price:
-                    logger.info(f"Google Hotels → ${price}")
-                    return price
+                txt = await el.inner_text()
+                prices = extract_prices_from_text(txt)
+                if prices:
+                    logger.info(f"Google Hotels (selector) → ${prices[0]}")
+                    return prices[0]
+
+        body = await page.inner_text("body")
+        dollar_prices = re.findall(r'\$(\d{2,5})', body)
+        for p in dollar_prices:
+            price = float(p)
+            if 40 < price < 15000:
+                logger.info(f"Google Hotels (text scan) → ${price}")
+                return price
+
+        logger.warning(f"Google Hotels: no price found. Page length: {len(body)} chars")
     except Exception as e:
         logger.error(f"Google Hotels error: {e}")
     return None
 
 
-async def check_hotel_prices(hotel):
-    results = {}
+async def scrape_kayak(page, name: str, checkin: str, checkout: str) -> float | None:
+    try:
+        ci = datetime.strptime(checkin, "%d/%m/%Y").strftime("%Y-%m-%d")
+        co = datetime.strptime(checkout, "%d/%m/%Y").strftime("%Y-%m-%d")
+        url = (
+            f"https://www.kayak.com/hotels/{name.replace(' ', '-')}"
+            f"/{ci}/{co}/1adults"
+        )
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+
+        for sel in [
+            '[class*="price-text"]',
+            '[class*="actualPrice"]',
+            '[class*="priceText"]',
+            'span[class*="price"]',
+        ]:
+            for el in await page.query_selector_all(sel):
+                txt = await el.inner_text()
+                prices = extract_prices_from_text(txt)
+                if prices:
+                    logger.info(f"Kayak → ${prices[0]}")
+                    return prices[0]
+
+        body = await page.inner_text("body")
+        dollar_prices = re.findall(r'\$(\d{2,5})', body)
+        for p in dollar_prices:
+            price = float(p)
+            if 40 < price < 15000:
+                logger.info(f"Kayak (text scan) → ${price}")
+                return price
+
+        logger.warning("Kayak: no price found")
+    except Exception as e:
+        logger.error(f"Kayak error: {e}")
+    return None
+
+
+async def scrape_booking(page, name: str, checkin: str, checkout: str) -> float | None:
+    try:
+        ci = datetime.strptime(checkin, "%d/%m/%Y").strftime("%Y-%m-%d")
+        co = datetime.strptime(checkout, "%d/%m/%Y").strftime("%Y-%m-%d")
+        url = (
+            f"https://www.booking.com/searchresults.html"
+            f"?ss={name.replace(' ', '+')}&checkin={ci}&checkout={co}"
+            f"&group_adults=2&no_rooms=1&selected_currency=USD"
+        )
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(4000)
+
+        title = await page.title()
+        logger.info(f"Booking.com page title: {title}")
+
+        if "just a moment" in title.lower() or "cloudflare" in title.lower():
+            logger.warning("Booking.com: Cloudflare challenge detected, skipping")
+            return None
+
+        for sel in [
+            '[data-testid="price-and-discounted-price"]',
+            '.prco-valign-middle-helper',
+            '.bui-price-display__value',
+            '[class*="price"]',
+        ]:
+            for el in await page.query_selector_all(sel):
+                txt = await el.inner_text()
+                prices = extract_prices_from_text(txt)
+                if prices:
+                    logger.info(f"Booking.com → ${prices[0]}")
+                    return prices[0]
+
+        body = await page.inner_text("body")
+        dollar_prices = re.findall(r'\$(\d{2,5})', body)
+        for p in dollar_prices:
+            price = float(p)
+            if 40 < price < 15000:
+                logger.info(f"Booking.com (text scan) → ${price}")
+                return price
+
+        logger.warning("Booking.com: no price found")
+    except Exception as e:
+        logger.error(f"Booking.com error: {e}")
+    return None
+
+
+async def check_hotel_prices(hotel: dict) -> dict[str, float]:
+    results: dict[str, float] = {}
     async with async_playwright() as p:
         browser, page = await _make_page(p)
         try:
-            for fn, label in [(scrape_booking, "Booking.com"), (scrape_expedia, "Expedia"), (scrape_google_hotels, "Google Hotels")]:
-                price = await fn(page, hotel["name"], hotel["checkin"], hotel["checkout"])
-                if price:
-                    results[label] = price
-                await page.wait_for_timeout(1500)
+            name = hotel["name"]
+            ci, co = hotel["checkin"], hotel["checkout"]
+            logger.info(f"Checking: {name} ({ci} → {co})")
+
+            price = await scrape_google_hotels(page, name, ci, co)
+            if price:
+                results["Google Hotels"] = price
+            await page.wait_for_timeout(2000)
+
+            price = await scrape_kayak(page, name, ci, co)
+            if price:
+                results["Kayak"] = price
+            await page.wait_for_timeout(2000)
+
+            price = await scrape_booking(page, name, ci, co)
+            if price:
+                results["Booking.com"] = price
+
         finally:
             await browser.close()
     return results
@@ -162,23 +265,36 @@ async def check_hotel_prices(hotel):
 async def run_check():
     hotels = load_hotels()
     if not hotels:
+        logger.info("No hotels configured.")
         return
+
     for hotel in hotels:
         prices = await check_hotel_prices(hotel)
+
         hotel.setdefault("price_history", []).append({
             "timestamp": datetime.now().isoformat(),
             "prices": prices,
         })
+
         if not prices:
+            logger.warning(f"No prices found for {hotel['name']}")
             continue
+
         min_price = min(prices.values())
         min_site = min(prices, key=prices.get)
         paid = hotel["paid_price"]
+        logger.info(f"{hotel['name']}: best=${min_price} on {min_site}, paid=${paid}")
+
         if min_price < paid:
             savings = paid - min_price
             pct = (savings / paid) * 100
-            nights = (datetime.strptime(hotel["checkout"], "%d/%m/%Y") - datetime.strptime(hotel["checkin"], "%d/%m/%Y")).days
-            price_lines = "\n".join(f"  • {s}: ${p:,.0f}" for s, p in sorted(prices.items(), key=lambda x: x[1]))
+            nights = (
+                datetime.strptime(hotel["checkout"], "%d/%m/%Y")
+                - datetime.strptime(hotel["checkin"], "%d/%m/%Y")
+            ).days
+            price_lines = "\n".join(
+                f"  • {s}: ${p:,.0f}" for s, p in sorted(prices.items(), key=lambda x: x[1])
+            )
             await send_telegram(
                 f"🏨 <b>Price Drop Alert!</b>\n\n<b>{hotel['name']}</b>\n"
                 f"📅 {hotel['checkin']} → {hotel['checkout']} ({nights} night{'s' if nights != 1 else ''})\n\n"
@@ -187,6 +303,9 @@ async def run_check():
                 f"💰 Saving:   <b>${savings:,.0f} ({pct:.0f}%)</b>\n\n"
                 f"<b>All prices:</b>\n{price_lines}"
             )
+        else:
+            logger.info(f"No drop – best ${min_price} vs paid ${paid}")
+
     save_hotels(hotels)
 
 
@@ -195,12 +314,14 @@ async def price_check_loop():
         try:
             await run_check()
         except Exception as e:
-            logger.error(f"Check error: {e}")
+            logger.error(f"Price-check loop error: {e}")
+        logger.info(f"Next check in {CHECK_INTERVAL_HOURS} hours.")
         await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)
 
 
-def _parse_add_command(text):
-    parts = [p.strip() for p in text[len("/add"):].strip().split("|")]
+def _parse_add_command(text: str) -> dict | None:
+    body = text[len("/add"):].strip()
+    parts = [p.strip() for p in body.split("|")]
     if len(parts) != 4:
         return None
     name, checkin, checkout, paid_str = parts
@@ -222,12 +343,12 @@ async def handle_commands():
             cmd = text.split()[0].lower() if text else ""
 
             if cmd == "/check":
-                await send_telegram("🔍 Running price check now…")
+                await send_telegram("🔍 Running price check now… (takes a few minutes)")
                 try:
                     await run_check()
-                    await send_telegram("✅ Done.")
+                    await send_telegram("✅ Price check complete. Send /prices to see results.")
                 except Exception as e:
-                    await send_telegram(f"❌ Failed: {e}")
+                    await send_telegram(f"❌ Check failed: {e}")
 
             elif cmd == "/prices":
                 hotels = load_hotels()
@@ -237,7 +358,10 @@ async def handle_commands():
                     msg = "<b>Latest Price Data:</b>\n\n"
                     for h in hotels:
                         history = h.get("price_history", [])
-                        nights = (datetime.strptime(h["checkout"], "%d/%m/%Y") - datetime.strptime(h["checkin"], "%d/%m/%Y")).days
+                        nights = (
+                            datetime.strptime(h["checkout"], "%d/%m/%Y")
+                            - datetime.strptime(h["checkin"], "%d/%m/%Y")
+                        ).days
                         msg += f"🏨 <b>{h['name']}</b>\n"
                         msg += f"📅 {h['checkin']} → {h['checkout']} ({nights} night{'s' if nights != 1 else ''})\n"
                         msg += f"💳 Paid: <b>${h['paid_price']:,.0f}</b>\n"
@@ -249,18 +373,18 @@ async def handle_commands():
                             min_site = min(prices, key=prices.get)
                             savings = h["paid_price"] - min_price
                             msg += f"🕐 Last check: {ts}\n"
-                            msg += f"🔥 Best now:  <b>${min_price:,.0f}</b> on {min_site}\n"
+                            msg += f"🔥 Best now: <b>${min_price:,.0f}</b> on {min_site}\n"
                             if savings > 0:
                                 pct = (savings / h["paid_price"]) * 100
                                 msg += f"💰 You'd save: <b>${savings:,.0f} ({pct:.0f}%)</b>\n"
                             else:
-                                msg += f"📈 No drop yet (${abs(savings):,.0f} above paid)\n"
+                                msg += f"📈 No drop yet (${abs(savings):,.0f} above what you paid)\n"
                             for site, price in sorted(prices.items(), key=lambda x: x[1]):
                                 msg += f"  • {site}: ${price:,.0f}\n"
                         elif history:
-                            msg += "⚠️ Last check found no prices\n"
+                            msg += "⚠️ Last check found no prices (sites may have blocked the scraper)\n"
                         else:
-                            msg += "⏳ No checks run yet\n"
+                            msg += "⏳ No checks run yet — send /check to start\n"
                         msg += "\n"
                     await send_telegram(msg.strip())
 
@@ -288,7 +412,10 @@ async def handle_commands():
             elif cmd == "/add":
                 hotel = _parse_add_command(text)
                 if not hotel:
-                    await send_telegram("❌ Use: <code>/add Name | DD/MM/YYYY | DD/MM/YYYY | price</code>")
+                    await send_telegram(
+                        "❌ Use: <code>/add Name | DD/MM/YYYY | DD/MM/YYYY | price</code>\n"
+                        "Example: <code>/add Marriott NYC | 15/06/2026 | 17/06/2026 | 350</code>"
+                    )
                 else:
                     hotels = load_hotels()
                     hotels.append(hotel)
@@ -310,6 +437,7 @@ async def handle_commands():
 
 
 async def main():
+    logger.info("Hotel Price Tracker starting…")
     hotels = load_hotels()
     await send_telegram(
         f"🏨 <b>Hotel Price Tracker started!</b>\n\n"
