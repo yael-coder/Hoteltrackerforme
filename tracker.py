@@ -5,7 +5,19 @@ import re
 import logging
 from datetime import datetime
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+window.chrome = {runtime: {}};
+const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query = (p) =>
+    p.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : _origQuery(p);
+"""
+
 import aiohttp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -102,7 +114,7 @@ async def _make_page(playwright):
         timezone_id="America/New_York",
     )
     page = await ctx.new_page()
-    await stealth_async(page)
+    await page.add_init_script(_STEALTH_JS)
     return browser, page
 
 
