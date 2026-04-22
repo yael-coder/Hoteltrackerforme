@@ -1,0 +1,27 @@
+name: E2E (nightly)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 2 AM UTC every night
+  workflow_dispatch:       # allow manual trigger from GitHub UI
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install chromium && playwright install-deps chromium
+
+      - name: Run E2E tests
+        run: pytest test_e2e.py -v --timeout=120
